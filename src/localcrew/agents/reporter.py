@@ -1,11 +1,11 @@
 """Report Generator Agent for research crew."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_reporter_agent(llm: MLXLLM | None = None) -> Agent:
+def create_reporter_agent(llm: BaseLLM | None = None) -> Agent:
     """Create a Report Generator agent that formats research output.
 
     The Report Generator agent:

@@ -1,11 +1,11 @@
 """Query Decomposer Agent for research crew."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_query_decomposer_agent(llm: MLXLLM | None = None) -> Agent:
+def create_query_decomposer_agent(llm: BaseLLM | None = None) -> Agent:
     """Create a Query Decomposer agent that breaks research queries into sub-questions.
 
     The Query Decomposer agent examines a research query and:

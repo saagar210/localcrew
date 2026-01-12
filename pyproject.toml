@@ -29,6 +29,7 @@ dependencies = [
     # MLX (Apple Silicon)
     "mlx>=0.30.0",
     "mlx-lm>=0.21.0",
+    "outlines>=0.1.0",
 
     # CLI
     "typer>=0.15.0",
