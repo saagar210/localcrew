@@ -51,8 +51,8 @@ logs/
 *.db
 *.sqlite3
 
-# MLX models (large files)
-models/
+# MLX models (large files) - only root models/ directory
+/models/
 *.safetensors
 *.gguf
 

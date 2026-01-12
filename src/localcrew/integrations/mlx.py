@@ -70,13 +70,17 @@ class MLXInference:
         self._load_model()
 
         from mlx_lm import generate
+        from mlx_lm.sample_utils import make_sampler
+
+        temp = temperature or self.temperature
+        sampler = make_sampler(temp=temp)
 
         response = generate(
             self._model,
             self._tokenizer,
             prompt=prompt,
             max_tokens=max_tokens or self.max_tokens,
-            temp=temperature or self.temperature,
+            sampler=sampler,
         )
 
         return response

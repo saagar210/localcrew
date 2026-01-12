@@ -47,6 +47,7 @@ class MLXLLM(BaseLLM):
         tools: list[dict] | None = None,
         callbacks: list[Any] | None = None,
         available_functions: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> str | Any:
         """Call the MLX model with the given messages.
 
@@ -55,6 +56,7 @@ class MLXLLM(BaseLLM):
             tools: Optional list of tool definitions (not supported by MLX)
             callbacks: Optional callbacks (not used)
             available_functions: Optional function mapping (not used)
+            **kwargs: Additional arguments from CrewAI (from_task, etc.)
 
         Returns:
             Generated text response
