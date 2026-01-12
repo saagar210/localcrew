@@ -1,5 +1,6 @@
 """Human review endpoints."""
 
+import json
 import logging
 from uuid import UUID
 
@@ -10,11 +11,88 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from localcrew.core.database import get_session
 from localcrew.core.types import utcnow
+from localcrew.integrations.kas import get_kas
 from localcrew.models.review import Review, ReviewCreate, ReviewRead, ReviewDecision
 from localcrew.models.feedback import Feedback, FeedbackType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _store_pattern_to_kas(review: Review) -> str | None:
+    """Store an approved/modified pattern to KAS for future reference.
+
+    When a human approves or modifies a decomposition, the validated
+    pattern is valuable knowledge that can inform future decompositions.
+
+    Args:
+        review: The approved/modified review
+
+    Returns:
+        KAS content_id if stored, None otherwise
+    """
+    kas = get_kas()
+    if kas is None:
+        return None
+
+    # Get the validated content (modified or original)
+    content = review.modified_content or review.original_content
+    if not content:
+        return None
+
+    try:
+        # Build pattern title based on content
+        if isinstance(content, dict):
+            title = f"Pattern: {content.get('title', 'Task Decomposition')}"
+        elif isinstance(content, list) and content:
+            first_item = content[0]
+            title = f"Pattern: {first_item.get('title', 'Task Decomposition')}"
+        else:
+            title = "Pattern: Task Decomposition"
+
+        # Build markdown content for the pattern
+        pattern_content = f"""# Validated Task Pattern
+
+## Context
+- **Review ID**: {review.id}
+- **Execution ID**: {review.execution_id}
+- **Decision**: {review.decision.value}
+- **Confidence**: {review.confidence_score}%
+
+## Pattern Details
+```json
+{json.dumps(content, indent=2)}
+```
+
+## Human Feedback
+{review.feedback or "No additional feedback provided."}
+"""
+
+        # Determine domain from content if available
+        domain = "general"
+        if isinstance(content, dict):
+            domain = content.get("domain", content.get("analysis", {}).get("domain", "general"))
+
+        # Store to KAS
+        content_id = await kas.ingest_research(
+            title=title,
+            content=pattern_content,
+            tags=["pattern", "decomposition", f"domain:{domain}", "validated"],
+            metadata={
+                "review_id": str(review.id),
+                "execution_id": str(review.execution_id),
+                "confidence_score": review.confidence_score,
+                "decision": review.decision.value,
+            },
+        )
+
+        if content_id:
+            logger.info(f"Stored validated pattern to KAS: {content_id}")
+        return content_id
+
+    except Exception as e:
+        logger.warning(f"Failed to store pattern to KAS: {e}")
+        return None
 
 
 async def _store_feedback(session: AsyncSession, review: Review) -> None:
@@ -134,6 +212,10 @@ async def submit_review(
     # Store feedback for prompt improvement
     if submission.feedback:
         await _store_feedback(session, review)
+
+    # Store validated patterns to KAS for future decompositions
+    if submission.decision in (ReviewDecision.APPROVED, ReviewDecision.MODIFIED):
+        await _store_pattern_to_kas(review)
 
     return ReviewRead.model_validate(review)
 

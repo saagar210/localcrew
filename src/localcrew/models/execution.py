@@ -33,6 +33,7 @@ class ExecutionBase(SQLModel):
     duration_ms: int | None = Field(default=None)
     model_used: str | None = Field(default=None, max_length=100)
     tokens_used: int | None = Field(default=None)
+    kas_content_id: str | None = Field(default=None, max_length=100, description="KAS content ID if stored")
 
 
 class Execution(ExecutionBase, table=True):

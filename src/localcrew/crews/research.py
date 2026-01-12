@@ -16,6 +16,7 @@ from localcrew.agents import (
     create_reporter_agent,
 )
 from localcrew.integrations.crewai_llm import MLXLLM
+from localcrew.integrations.kas import get_kas
 from localcrew.integrations.structured_crewai_llm import StructuredMLXLLM
 from localcrew.schemas import (
     QueryDecomposition,
@@ -42,7 +43,7 @@ class Finding(BaseModel):
     source_title: str
     content: str
     credibility: str = "medium"  # high, medium, low
-    retrieved_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    retrieved_at: str = Field(default_factory=lambda: datetime.now().astimezone().isoformat())
 
 
 class ResearchState(BaseModel):
@@ -107,6 +108,41 @@ class ResearchFlow(Flow[ResearchState]):
             self._gatherer_llm = MLXLLM()
             self._synthesizer_llm = MLXLLM()
             self._reporter_llm = MLXLLM()
+
+    def _query_kas_sync(self, sub_questions: list[SubQuestion]) -> list[Finding]:
+        """Query KAS for relevant knowledge before external research.
+
+        Uses synchronous HTTP client to avoid event loop conflicts
+        with uvloop in FastAPI/CrewAI contexts.
+
+        Args:
+            sub_questions: List of sub-questions to search for
+
+        Returns:
+            List of Finding objects from KAS, empty if KAS unavailable
+        """
+        kas = get_kas()
+        if kas is None:
+            return []
+
+        kas_findings = []
+        for sq in sub_questions:
+            try:
+                results = kas.search_sync(sq.question, limit=3)
+                for r in results:
+                    if r.score > 0.7 and r.chunk_text:  # Only high-confidence results with content
+                        kas_findings.append(Finding(
+                            source_url=f"kas://{r.content_id}",
+                            source_title=f"[KB] {r.title}",
+                            content=r.chunk_text,
+                            credibility="high",  # KAS = vetted personal knowledge
+                        ))
+            except Exception as e:
+                logger.warning(f"KAS query failed for '{sq.question[:50]}...': {e}")
+
+        if kas_findings:
+            logger.info(f"Found {len(kas_findings)} relevant items from knowledge base")
+        return kas_findings
 
     @start()
     def decompose_query(self) -> str:
@@ -180,6 +216,9 @@ Output as JSON with a "sub_questions" array.""",
         """Gather information for each sub-question."""
         logger.info(f"Gathering information for {len(self.state.sub_questions)} sub-questions...")
 
+        # Query KAS first for existing knowledge (using sync client)
+        kas_findings = self._query_kas_sync(self.state.sub_questions)
+
         gatherer = create_gatherer_agent(self._gatherer_llm)
 
         # Format sub-questions for the task
@@ -220,7 +259,7 @@ Output as JSON with:
             if not isinstance(findings_data, list):
                 findings_data = [findings_data]
 
-            self.state.findings = [
+            agent_findings = [
                 Finding(**f) if isinstance(f, dict) else Finding(
                     source_url="https://example.com",
                     source_title="Research Source",
@@ -228,10 +267,9 @@ Output as JSON with:
                 )
                 for f in findings_data
             ]
-            logger.info(f"Gathered {len(self.state.findings)} findings")
         except json.JSONDecodeError as e:
             logger.warning(f"Could not parse findings: {e}")
-            self.state.findings = [
+            agent_findings = [
                 Finding(
                     source_url="https://docs.example.com",
                     source_title="Documentation",
@@ -239,6 +277,13 @@ Output as JSON with:
                     credibility="medium",
                 )
             ]
+
+        # Combine: KAS findings first (higher credibility), then agent findings
+        self.state.findings = kas_findings + agent_findings
+        logger.info(
+            f"Gathered {len(self.state.findings)} findings "
+            f"({len(kas_findings)} from KB, {len(agent_findings)} from research)"
+        )
 
         return "gathering_complete"
 
@@ -316,10 +361,26 @@ Output as JSON with:
 
         # Format synthesis for report
         synthesis_text = json.dumps(self.state.synthesis, indent=2)
-        sources_text = "\n".join([
-            f"- {f.source_title}: {f.source_url}"
-            for f in self.state.findings
-        ])
+
+        # Separate KAS sources from external sources
+        kas_sources = [f for f in self.state.findings if f.source_url.startswith("kas://")]
+        external_sources = [f for f in self.state.findings if not f.source_url.startswith("kas://")]
+
+        sources_text = ""
+        if kas_sources:
+            sources_text += "From your knowledge base:\n"
+            sources_text += "\n".join([
+                f"- {f.source_title}: {f.source_url}"
+                for f in kas_sources
+            ])
+            sources_text += "\n\n"
+
+        if external_sources:
+            sources_text += "External sources:\n"
+            sources_text += "\n".join([
+                f"- {f.source_title}: {f.source_url}"
+                for f in external_sources
+            ])
 
         report_task = Task(
             description=f"""Create a {self.state.depth} research report in {self.state.output_format} format.
@@ -337,7 +398,7 @@ Report Requirements:
 2. List key points as bullets
 3. Provide detailed analysis
 4. Note any limitations
-5. End with a Sources section listing all references
+5. End with a Sources section - separate "From your knowledge base:" and "External sources:" sections
 
 Use inline citations: [Source Name](url)
 Confidence Score: {self.state.confidence_score}%""",

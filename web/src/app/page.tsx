@@ -22,6 +22,7 @@ import {
   type HealthStatus,
 } from "@/lib/api";
 import { StatusBadge, formatDuration, formatDate } from "@/lib/formatters";
+import { KASStatsWidget } from "@/components/kas-stats-widget";
 
 export default function Home() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
@@ -99,7 +100,7 @@ export default function Home() {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -144,6 +145,8 @@ export default function Home() {
             </div>
           </CardContent>
         </Card>
+
+        <KASStatsWidget />
       </div>
 
       {/* Recent Executions */}

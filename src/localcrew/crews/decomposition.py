@@ -14,6 +14,7 @@ from localcrew.agents import (
     create_validator_agent,
 )
 from localcrew.integrations.crewai_llm import MLXLLM
+from localcrew.integrations.kas import get_kas
 from localcrew.integrations.structured_crewai_llm import StructuredMLXLLM
 from localcrew.models.subtask import SubtaskType
 from localcrew.schemas import (
@@ -25,12 +26,25 @@ from localcrew.schemas import (
 logger = logging.getLogger(__name__)
 
 
+class KASPattern(BaseModel):
+    """A pattern retrieved from KAS knowledge base."""
+
+    content_id: str
+    title: str
+    content_type: str
+    pattern_text: str
+    score: float
+
+
 class DecompositionState(BaseModel):
     """State for the decomposition flow."""
 
     task_text: str = ""
     project_context: str | None = None
     taskmaster_context: dict[str, Any] | None = None
+
+    # KAS patterns from knowledge base
+    kas_patterns: list[KASPattern] = Field(default_factory=list)
 
     # Analysis output
     analysis: dict[str, Any] = Field(default_factory=dict)
@@ -83,10 +97,63 @@ class TaskDecompositionFlow(Flow[DecompositionState]):
             self._planner_llm = MLXLLM()
             self._validator_llm = MLXLLM()
 
+    def _query_kas_for_patterns(self, task_text: str) -> list[KASPattern]:
+        """Query KAS for relevant patterns before decomposition.
+
+        Searches for similar past decompositions, task patterns, and
+        best practices that can inform the current analysis.
+
+        Uses synchronous HTTP client to avoid event loop conflicts
+        with uvloop in FastAPI/CrewAI contexts.
+
+        Args:
+            task_text: The task to find patterns for
+
+        Returns:
+            List of KASPattern objects, empty if KAS unavailable
+        """
+        kas = get_kas()
+        if kas is None:
+            return []
+
+        patterns = []
+
+        # Search strategies: task description, domain keywords, pattern type
+        search_queries = [
+            f"task decomposition {task_text[:100]}",
+            f"subtask pattern {task_text[:50]}",
+        ]
+
+        for query in search_queries:
+            try:
+                results = kas.search_sync(query, limit=3)
+                for r in results:
+                    # Only high-confidence results with content
+                    if r.score > 0.6 and r.chunk_text:
+                        # Avoid duplicates
+                        if not any(p.content_id == r.content_id for p in patterns):
+                            patterns.append(KASPattern(
+                                content_id=r.content_id,
+                                title=r.title,
+                                content_type=r.content_type,
+                                pattern_text=r.chunk_text,
+                                score=r.score,
+                            ))
+            except Exception as e:
+                logger.warning(f"KAS pattern query failed: {e}")
+
+        if patterns:
+            logger.info(f"Found {len(patterns)} patterns from knowledge base")
+
+        return patterns
+
     @start()
     def analyze_task(self) -> str:
         """Analyze the task to understand scope and requirements."""
         logger.info(f"Analyzing task: {self.state.task_text[:100]}...")
+
+        # Query KAS for relevant patterns first
+        self.state.kas_patterns = self._query_kas_for_patterns(self.state.task_text)
 
         analyzer = create_analyzer_agent(self._analyzer_llm)
 
@@ -97,6 +164,16 @@ class TaskDecompositionFlow(Flow[DecompositionState]):
         if self.state.taskmaster_context:
             context_parts.append(
                 f"Existing tasks context: {json.dumps(self.state.taskmaster_context)}"
+            )
+
+        # Include KAS patterns if found
+        if self.state.kas_patterns:
+            patterns_text = "\n".join([
+                f"- [{p.title}] (score: {p.score:.2f}): {p.pattern_text[:200]}..."
+                for p in self.state.kas_patterns[:3]  # Top 3 patterns
+            ])
+            context_parts.append(
+                f"Relevant patterns from knowledge base:\n{patterns_text}"
             )
 
         analysis_task = Task(
