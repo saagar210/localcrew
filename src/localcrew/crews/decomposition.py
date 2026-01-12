@@ -1,11 +1,10 @@
-"""Task Decomposition Crew using CrewAI Flows."""
+"""Task Decomposition Crew using CrewAI Flows with structured outputs."""
 
 import json
 import logging
-import re
 from typing import Any
 
-from crewai import Crew, Process, Task
+from crewai import BaseLLM, Crew, Process, Task
 from crewai.flow.flow import Flow, listen, start
 from pydantic import BaseModel, Field
 
@@ -15,9 +14,26 @@ from localcrew.agents import (
     create_validator_agent,
 )
 from localcrew.integrations.crewai_llm import MLXLLM
+from localcrew.integrations.kas import get_kas
+from localcrew.integrations.structured_crewai_llm import StructuredMLXLLM
 from localcrew.models.subtask import SubtaskType
+from localcrew.schemas import (
+    SubtaskPlan,
+    TaskAnalysis,
+    ValidationResult,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class KASPattern(BaseModel):
+    """A pattern retrieved from KAS knowledge base."""
+
+    content_id: str
+    title: str
+    content_type: str
+    pattern_text: str
+    score: float
 
 
 class DecompositionState(BaseModel):
@@ -26,6 +42,9 @@ class DecompositionState(BaseModel):
     task_text: str = ""
     project_context: str | None = None
     taskmaster_context: dict[str, Any] | None = None
+
+    # KAS patterns from knowledge base
+    kas_patterns: list[KASPattern] = Field(default_factory=list)
 
     # Analysis output
     analysis: dict[str, Any] = Field(default_factory=dict)
@@ -41,23 +60,102 @@ class DecompositionState(BaseModel):
 
 
 class TaskDecompositionFlow(Flow[DecompositionState]):
-    """Flow for decomposing tasks into subtasks using multiple agents."""
+    """Flow for decomposing tasks into subtasks using multiple agents.
 
-    def __init__(self, llm: MLXLLM | None = None) -> None:
+    Uses structured outputs via outlines to guarantee valid JSON responses
+    that match the expected schemas.
+    """
+
+    def __init__(
+        self,
+        llm: BaseLLM | None = None,
+        use_structured_outputs: bool = True,
+    ) -> None:
         """Initialize the decomposition flow.
 
         Args:
-            llm: Optional custom LLM. Uses MLX by default.
+            llm: Optional custom LLM. Uses MLX with structured outputs by default.
+            use_structured_outputs: Whether to use outlines for guaranteed JSON.
+                                   Set to False for fallback to regex parsing.
         """
         super().__init__()
-        self.llm = llm or MLXLLM()
+        self.use_structured_outputs = use_structured_outputs
+
+        # If custom LLM provided, use it for all agents
+        if llm is not None:
+            self._analyzer_llm = llm
+            self._planner_llm = llm
+            self._validator_llm = llm
+        elif use_structured_outputs:
+            # Create structured LLMs with appropriate schemas
+            self._analyzer_llm = StructuredMLXLLM(output_schema=TaskAnalysis)
+            self._planner_llm = StructuredMLXLLM(output_schema=SubtaskPlan)
+            self._validator_llm = StructuredMLXLLM(output_schema=ValidationResult)
+        else:
+            # Fallback to unstructured MLX
+            self._analyzer_llm = MLXLLM()
+            self._planner_llm = MLXLLM()
+            self._validator_llm = MLXLLM()
+
+    def _query_kas_for_patterns(self, task_text: str) -> list[KASPattern]:
+        """Query KAS for relevant patterns before decomposition.
+
+        Searches for similar past decompositions, task patterns, and
+        best practices that can inform the current analysis.
+
+        Uses synchronous HTTP client to avoid event loop conflicts
+        with uvloop in FastAPI/CrewAI contexts.
+
+        Args:
+            task_text: The task to find patterns for
+
+        Returns:
+            List of KASPattern objects, empty if KAS unavailable
+        """
+        kas = get_kas()
+        if kas is None:
+            return []
+
+        patterns = []
+
+        # Search strategies: task description, domain keywords, pattern type
+        search_queries = [
+            f"task decomposition {task_text[:100]}",
+            f"subtask pattern {task_text[:50]}",
+        ]
+
+        for query in search_queries:
+            try:
+                results = kas.search_sync(query, limit=3)
+                for r in results:
+                    # Only high-confidence results with content
+                    if r.score > 0.6 and r.chunk_text:
+                        # Avoid duplicates
+                        if not any(p.content_id == r.content_id for p in patterns):
+                            patterns.append(KASPattern(
+                                content_id=r.content_id,
+                                title=r.title,
+                                content_type=r.content_type,
+                                pattern_text=r.chunk_text,
+                                score=r.score,
+                            ))
+            except Exception as e:
+                logger.warning(f"KAS pattern query failed: {e}")
+
+        if patterns:
+            logger.info(f"Found {len(patterns)} patterns from knowledge base")
+
+        return patterns
 
     @start()
     def analyze_task(self) -> str:
         """Analyze the task to understand scope and requirements."""
         logger.info(f"Analyzing task: {self.state.task_text[:100]}...")
 
-        analyzer = create_analyzer_agent(self.llm)
+        # Query KAS for relevant patterns first
+        self.state.kas_patterns = self._query_kas_for_patterns(self.state.task_text)
+
+        analyzer = create_analyzer_agent(self._analyzer_llm)
 
         # Build context string
         context_parts = [f"Task to analyze: {self.state.task_text}"]
@@ -66,6 +164,16 @@ class TaskDecompositionFlow(Flow[DecompositionState]):
         if self.state.taskmaster_context:
             context_parts.append(
                 f"Existing tasks context: {json.dumps(self.state.taskmaster_context)}"
+            )
+
+        # Include KAS patterns if found
+        if self.state.kas_patterns:
+            patterns_text = "\n".join([
+                f"- [{p.title}] (score: {p.score:.2f}): {p.pattern_text[:200]}..."
+                for p in self.state.kas_patterns[:3]  # Top 3 patterns
+            ])
+            context_parts.append(
+                f"Relevant patterns from knowledge base:\n{patterns_text}"
             )
 
         analysis_task = Task(
@@ -96,10 +204,10 @@ Provide your analysis as JSON with:
 
         # Parse the analysis from the result
         try:
-            analysis = self._extract_json(result.raw)
+            analysis = json.loads(result.raw)
             self.state.analysis = analysis
             logger.info(f"Analysis complete: {analysis.get('domain', 'unknown')} domain")
-        except Exception as e:
+        except json.JSONDecodeError as e:
             logger.warning(f"Could not parse analysis JSON: {e}")
             self.state.analysis = {
                 "domain": "coding",
@@ -118,7 +226,7 @@ Provide your analysis as JSON with:
         """Create the subtask breakdown based on analysis."""
         logger.info("Planning subtasks...")
 
-        planner = create_planner_agent(self.llm)
+        planner = create_planner_agent(self._planner_llm)
 
         planning_task = Task(
             description=f"""Based on the following task and analysis, create a detailed subtask breakdown.
@@ -130,16 +238,14 @@ Analysis:
 
 Create {self.state.analysis.get('estimated_subtask_count', 5)} subtasks.
 
-For each subtask, provide JSON with:
+Provide JSON with a "subtasks" array where each subtask has:
 - title: Clear, concise title (imperative form, e.g., "Implement user authentication")
 - description: Detailed description of what needs to be done
 - subtask_type: One of: {', '.join([t.value for t in SubtaskType])}
 - estimated_complexity: low, medium, or high
 - dependencies: Array of indices of subtasks this depends on (0-indexed)
-- order_index: Execution order (0, 1, 2, ...)
-
-Output as a JSON array of subtask objects.""",
-            expected_output="JSON array of subtasks",
+- order_index: Execution order (0, 1, 2, ...)""",
+            expected_output="JSON object with subtasks array",
             agent=planner,
         )
 
@@ -154,14 +260,17 @@ Output as a JSON array of subtask objects.""",
 
         # Parse the subtasks
         try:
-            subtasks = self._extract_json(result.raw)
-            if isinstance(subtasks, dict) and "subtasks" in subtasks:
-                subtasks = subtasks["subtasks"]
-            if not isinstance(subtasks, list):
-                subtasks = [subtasks]
+            plan_data = json.loads(result.raw)
+            # Handle both {"subtasks": [...]} and direct array format
+            if isinstance(plan_data, dict) and "subtasks" in plan_data:
+                subtasks = plan_data["subtasks"]
+            elif isinstance(plan_data, list):
+                subtasks = plan_data
+            else:
+                subtasks = [plan_data]
             self.state.planned_subtasks = subtasks
             logger.info(f"Planned {len(subtasks)} subtasks")
-        except Exception as e:
+        except json.JSONDecodeError as e:
             logger.warning(f"Could not parse subtasks JSON: {e}")
             self.state.planned_subtasks = self._create_fallback_subtasks()
 
@@ -172,7 +281,7 @@ Output as a JSON array of subtask objects.""",
         """Validate the subtask breakdown and assign confidence scores."""
         logger.info("Validating subtasks...")
 
-        validator = create_validator_agent(self.llm)
+        validator = create_validator_agent(self._validator_llm)
 
         validation_task = Task(
             description=f"""Validate the following task decomposition and assign confidence scores.
@@ -192,7 +301,7 @@ For each subtask:
    - Below 50: Significant concerns, requires review
 
 Output JSON with:
-- validated_subtasks: Array of subtasks with confidence_score added
+- validated_subtasks: Array of subtasks with confidence_score added (keep all original fields)
 - overall_confidence: Average confidence (0-100)
 - issues: Array of any concerns found
 - suggestions: Array of improvements if any""",
@@ -211,7 +320,7 @@ Output JSON with:
 
         # Parse validation results
         try:
-            validation = self._extract_json(result.raw)
+            validation = json.loads(result.raw)
             self.state.validated_subtasks = validation.get(
                 "validated_subtasks", self.state.planned_subtasks
             )
@@ -219,7 +328,7 @@ Output JSON with:
             self.state.issues = validation.get("issues", [])
             self.state.suggestions = validation.get("suggestions", [])
             logger.info(f"Validation complete. Confidence: {self.state.overall_confidence}%")
-        except Exception as e:
+        except json.JSONDecodeError as e:
             logger.warning(f"Could not parse validation JSON: {e}")
             # Assign default confidence scores
             self.state.validated_subtasks = [
@@ -228,48 +337,6 @@ Output JSON with:
             self.state.overall_confidence = 75
 
         return "validation_complete"
-
-    def _extract_json(self, text: str) -> dict | list:
-        """Extract JSON from LLM response text.
-
-        Handles cases where JSON is wrapped in markdown code blocks.
-        """
-        # Try to find JSON in code blocks first
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-        if json_match:
-            text = json_match.group(1)
-
-        # Try to find JSON array or object
-        text = text.strip()
-
-        # Find first [ or {
-        start_bracket = -1
-        start_brace = -1
-
-        for i, c in enumerate(text):
-            if c == "[" and start_bracket == -1:
-                start_bracket = i
-            elif c == "{" and start_brace == -1:
-                start_brace = i
-            if start_bracket != -1 and start_brace != -1:
-                break
-
-        # Use whichever comes first
-        if start_bracket == -1 and start_brace == -1:
-            raise ValueError("No JSON found in text")
-
-        if start_bracket != -1 and (start_brace == -1 or start_bracket < start_brace):
-            # Array
-            end = text.rfind("]")
-            if end != -1:
-                text = text[start_bracket : end + 1]
-        else:
-            # Object
-            end = text.rfind("}")
-            if end != -1:
-                text = text[start_brace : end + 1]
-
-        return json.loads(text)
 
     def _create_fallback_subtasks(self) -> list[dict[str, Any]]:
         """Create fallback subtasks if planning fails."""
@@ -321,6 +388,7 @@ async def run_decomposition(
     task_text: str,
     project_context: str | None = None,
     taskmaster_context: dict[str, Any] | None = None,
+    use_structured_outputs: bool = True,
 ) -> DecompositionState:
     """Run the task decomposition flow.
 
@@ -328,11 +396,12 @@ async def run_decomposition(
         task_text: The task to decompose
         project_context: Optional project context
         taskmaster_context: Optional Task Master context
+        use_structured_outputs: Whether to use outlines for guaranteed JSON
 
     Returns:
         DecompositionState with validated subtasks and confidence scores
     """
-    flow = TaskDecompositionFlow()
+    flow = TaskDecompositionFlow(use_structured_outputs=use_structured_outputs)
     flow.state.task_text = task_text
     flow.state.project_context = project_context
     flow.state.taskmaster_context = taskmaster_context

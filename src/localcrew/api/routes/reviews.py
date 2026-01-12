@@ -1,20 +1,154 @@
 """Human review endpoints."""
 
+import json
 import logging
+import re
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from localcrew.core.database import get_session
 from localcrew.core.types import utcnow
+from localcrew.integrations.kas import get_kas
 from localcrew.models.review import Review, ReviewCreate, ReviewRead, ReviewDecision
 from localcrew.models.feedback import Feedback, FeedbackType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class SyncableTaskContent(BaseModel):
+    """Validated content for Task Master sync.
+
+    Sanitizes input to prevent JSON injection and ensures safe values.
+    """
+
+    title: str = Field(..., min_length=1, max_length=500)
+    description: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def sanitize_text(cls, v: Any) -> str | None:
+        """Remove control characters and sanitize text."""
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            v = str(v)
+        # Remove null bytes and control characters (except newline, tab)
+        sanitized = re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]", "", v)
+        return sanitized.strip()
+
+
+def _validate_sync_content(content: dict | list) -> list[SyncableTaskContent]:
+    """Validate and sanitize content before syncing to Task Master.
+
+    Args:
+        content: Raw content from review (dict or list of dicts)
+
+    Returns:
+        List of validated SyncableTaskContent objects
+
+    Raises:
+        ValueError: If content is invalid or contains malicious data
+    """
+    if isinstance(content, dict):
+        content = [content]
+
+    if not isinstance(content, list):
+        raise ValueError("Content must be a dict or list of dicts")
+
+    validated = []
+    for item in content:
+        if not isinstance(item, dict):
+            raise ValueError("Each item must be a dict")
+        if "title" not in item:
+            raise ValueError("Each item must have a 'title' field")
+        validated.append(SyncableTaskContent(
+            title=item.get("title"),
+            description=item.get("description"),
+        ))
+
+    return validated
+
+
+async def _store_pattern_to_kas(review: Review) -> str | None:
+    """Store an approved/modified pattern to KAS for future reference.
+
+    When a human approves or modifies a decomposition, the validated
+    pattern is valuable knowledge that can inform future decompositions.
+
+    Args:
+        review: The approved/modified review
+
+    Returns:
+        KAS content_id if stored, None otherwise
+    """
+    kas = get_kas()
+    if kas is None:
+        return None
+
+    # Get the validated content (modified or original)
+    content = review.modified_content or review.original_content
+    if not content:
+        return None
+
+    try:
+        # Build pattern title based on content
+        if isinstance(content, dict):
+            title = f"Pattern: {content.get('title', 'Task Decomposition')}"
+        elif isinstance(content, list) and content:
+            first_item = content[0]
+            title = f"Pattern: {first_item.get('title', 'Task Decomposition')}"
+        else:
+            title = "Pattern: Task Decomposition"
+
+        # Build markdown content for the pattern
+        pattern_content = f"""# Validated Task Pattern
+
+## Context
+- **Review ID**: {review.id}
+- **Execution ID**: {review.execution_id}
+- **Decision**: {review.decision.value}
+- **Confidence**: {review.confidence_score}%
+
+## Pattern Details
+```json
+{json.dumps(content, indent=2)}
+```
+
+## Human Feedback
+{review.feedback or "No additional feedback provided."}
+"""
+
+        # Determine domain from content if available
+        domain = "general"
+        if isinstance(content, dict):
+            domain = content.get("domain", content.get("analysis", {}).get("domain", "general"))
+
+        # Store to KAS
+        content_id = await kas.ingest_research(
+            title=title,
+            content=pattern_content,
+            tags=["pattern", "decomposition", f"domain:{domain}", "validated"],
+            metadata={
+                "review_id": str(review.id),
+                "execution_id": str(review.execution_id),
+                "confidence_score": review.confidence_score,
+                "decision": review.decision.value,
+            },
+        )
+
+        if content_id:
+            logger.info(f"Stored validated pattern to KAS: {content_id}")
+        return content_id
+
+    except Exception as e:
+        logger.warning(f"Failed to store pattern to KAS: {e}")
+        return None
 
 
 async def _store_feedback(session: AsyncSession, review: Review) -> None:
@@ -135,6 +269,10 @@ async def submit_review(
     if submission.feedback:
         await _store_feedback(session, review)
 
+    # Store validated patterns to KAS for future decompositions
+    if submission.decision in (ReviewDecision.APPROVED, ReviewDecision.MODIFIED):
+        await _store_pattern_to_kas(review)
+
     return ReviewRead.model_validate(review)
 
 
@@ -160,30 +298,31 @@ async def sync_review_to_taskmaster(
     if not content:
         raise HTTPException(status_code=400, detail="No content to sync")
 
+    # Validate and sanitize content before syncing
+    try:
+        validated_tasks = _validate_sync_content(content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid content: {e}")
+
     # Sync to Task Master
     from localcrew.integrations.taskmaster import get_taskmaster
     taskmaster = get_taskmaster()
 
     try:
-        # If content is a subtask, create it in Task Master
-        if isinstance(content, dict) and "title" in content:
+        synced_ids = []
+        for task in validated_tasks:
             task_id = await taskmaster._create_task(
-                title=content.get("title", "Untitled"),
-                description=content.get("description"),
+                title=task.title,
+                description=task.description,
             )
-            return {"synced": True, "task_id": task_id}
+            synced_ids.append(task_id)
 
-        # If content is a list of subtasks
-        if isinstance(content, list):
-            synced_ids = await taskmaster.sync_subtasks(
-                execution_id=review.execution_id,
-                subtasks=content,
-            )
-            return {"synced": True, "task_ids": synced_ids}
-
-        return {"synced": False, "reason": "Unknown content format"}
+        if len(synced_ids) == 1:
+            return {"synced": True, "task_id": synced_ids[0]}
+        return {"synced": True, "task_ids": synced_ids}
 
     except Exception as e:
+        logger.error(f"Task Master sync failed: {e}")
         raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
 
 

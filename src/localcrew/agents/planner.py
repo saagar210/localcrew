@@ -1,11 +1,11 @@
 """Planner Agent for task decomposition."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_planner_agent(llm: MLXLLM | None = None) -> Agent:
+def create_planner_agent(llm: BaseLLM | None = None) -> Agent:
     """Create a Planner agent that creates subtask structure.
 
     The Planner agent takes the analysis and:

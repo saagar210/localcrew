@@ -29,6 +29,7 @@ dependencies = [
     # MLX (Apple Silicon)
     "mlx>=0.30.0",
     "mlx-lm>=0.21.0",
+    "outlines>=0.1.0",
 
     # CLI
     "typer>=0.15.0",
@@ -41,6 +42,7 @@ dependencies = [
     "httpx>=0.28.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.0",
+    "nest-asyncio>=1.6.0",
 ]
 
 [project.optional-dependencies]

@@ -1,11 +1,11 @@
 """Validator Agent for task decomposition."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_validator_agent(llm: MLXLLM | None = None) -> Agent:
+def create_validator_agent(llm: BaseLLM | None = None) -> Agent:
     """Create a Validator agent that checks decomposition completeness.
 
     The Validator agent reviews the decomposition and:

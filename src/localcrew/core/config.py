@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,25 @@ class Settings(BaseSettings):
     # MLflow
     mlflow_tracking_uri: str = "http://localhost:5000"
     mlflow_experiment_name: str = "localcrew"
+
+    # KAS Integration (Knowledge Activation System)
+    kas_enabled: bool = False
+    kas_base_url: str = "http://localhost:8000"
+    kas_api_key: str | None = None
+    kas_timeout: float = 10.0
+
+    @field_validator("kas_api_key")
+    @classmethod
+    def validate_kas_api_key(cls, v: str | None) -> str | None:
+        """Validate KAS API key to prevent header injection."""
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        if any(char in cleaned for char in ["\n", "\r", "\0"]):
+            raise ValueError("KAS API key contains invalid characters")
+        return cleaned
 
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

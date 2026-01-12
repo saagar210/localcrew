@@ -1,11 +1,11 @@
 """Information Gatherer Agent for research crew."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_gatherer_agent(llm: MLXLLM | None = None) -> Agent:
+def create_gatherer_agent(llm: BaseLLM | None = None) -> Agent:
     """Create an Information Gatherer agent that searches for information.
 
     The Information Gatherer agent:

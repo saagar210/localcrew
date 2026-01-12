@@ -1,11 +1,11 @@
 """Synthesizer Agent for research crew."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_synthesizer_agent(llm: MLXLLM | None = None) -> Agent:
+def create_synthesizer_agent(llm: BaseLLM | None = None) -> Agent:
     """Create a Synthesizer agent that combines research findings.
 
     The Synthesizer agent:

@@ -1,11 +1,11 @@
 """Analyzer Agent for task decomposition."""
 
-from crewai import Agent
+from crewai import Agent, BaseLLM
 
 from localcrew.integrations.crewai_llm import MLXLLM
 
 
-def create_analyzer_agent(llm: MLXLLM | None = None) -> Agent:
+def create_analyzer_agent(llm: BaseLLM | None = None) -> Agent:
     """Create an Analyzer agent that understands task scope.
 
     The Analyzer agent examines the input task and:

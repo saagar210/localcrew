@@ -1,11 +1,11 @@
 """Base service class with common functionality."""
 
-from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from localcrew.core.types import utcnow
 from localcrew.models.execution import Execution, ExecutionStatus
 
 
@@ -67,6 +67,6 @@ class BaseCrewService:
             execution.tokens_used = tokens_used
 
         if status in [ExecutionStatus.COMPLETED, ExecutionStatus.FAILED]:
-            execution.completed_at = datetime.utcnow()
+            execution.completed_at = utcnow()
 
         await self.session.commit()

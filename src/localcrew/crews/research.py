@@ -1,12 +1,11 @@
-"""Research Crew using CrewAI Flows."""
+"""Research Crew using CrewAI Flows with structured outputs."""
 
 import json
 import logging
-import re
 from datetime import datetime
 from typing import Any
 
-from crewai import Crew, Process, Task
+from crewai import BaseLLM, Crew, Process, Task
 from crewai.flow.flow import Flow, listen, start
 from pydantic import BaseModel, Field
 
@@ -17,6 +16,13 @@ from localcrew.agents import (
     create_reporter_agent,
 )
 from localcrew.integrations.crewai_llm import MLXLLM
+from localcrew.integrations.kas import get_kas
+from localcrew.integrations.structured_crewai_llm import StructuredMLXLLM
+from localcrew.schemas import (
+    QueryDecomposition,
+    GatheredFindings,
+    ResearchSynthesis,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +43,7 @@ class Finding(BaseModel):
     source_title: str
     content: str
     credibility: str = "medium"  # high, medium, low
-    retrieved_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    retrieved_at: str = Field(default_factory=lambda: datetime.now().astimezone().isoformat())
 
 
 class ResearchState(BaseModel):
@@ -63,23 +69,87 @@ class ResearchState(BaseModel):
 
 
 class ResearchFlow(Flow[ResearchState]):
-    """Flow for conducting research using multiple agents."""
+    """Flow for conducting research using multiple agents.
 
-    def __init__(self, llm: MLXLLM | None = None) -> None:
+    Uses structured outputs via outlines to guarantee valid JSON responses
+    that match the expected schemas.
+    """
+
+    def __init__(
+        self,
+        llm: BaseLLM | None = None,
+        use_structured_outputs: bool = True,
+    ) -> None:
         """Initialize the research flow.
 
         Args:
-            llm: Optional custom LLM. Uses MLX by default.
+            llm: Optional custom LLM. Uses MLX with structured outputs by default.
+            use_structured_outputs: Whether to use outlines for guaranteed JSON.
         """
         super().__init__()
-        self.llm = llm or MLXLLM()
+        self.use_structured_outputs = use_structured_outputs
+
+        # If custom LLM provided, use it for all agents
+        if llm is not None:
+            self._decomposer_llm = llm
+            self._gatherer_llm = llm
+            self._synthesizer_llm = llm
+            self._reporter_llm = llm
+        elif use_structured_outputs:
+            # Create structured LLMs with appropriate schemas
+            self._decomposer_llm = StructuredMLXLLM(output_schema=QueryDecomposition)
+            self._gatherer_llm = StructuredMLXLLM(output_schema=GatheredFindings)
+            self._synthesizer_llm = StructuredMLXLLM(output_schema=ResearchSynthesis)
+            # Reporter outputs markdown, no structured schema needed
+            self._reporter_llm = MLXLLM()
+        else:
+            # Fallback to unstructured MLX
+            self._decomposer_llm = MLXLLM()
+            self._gatherer_llm = MLXLLM()
+            self._synthesizer_llm = MLXLLM()
+            self._reporter_llm = MLXLLM()
+
+    def _query_kas_sync(self, sub_questions: list[SubQuestion]) -> list[Finding]:
+        """Query KAS for relevant knowledge before external research.
+
+        Uses synchronous HTTP client to avoid event loop conflicts
+        with uvloop in FastAPI/CrewAI contexts.
+
+        Args:
+            sub_questions: List of sub-questions to search for
+
+        Returns:
+            List of Finding objects from KAS, empty if KAS unavailable
+        """
+        kas = get_kas()
+        if kas is None:
+            return []
+
+        kas_findings = []
+        for sq in sub_questions:
+            try:
+                results = kas.search_sync(sq.question, limit=3)
+                for r in results:
+                    if r.score > 0.7 and r.chunk_text:  # Only high-confidence results with content
+                        kas_findings.append(Finding(
+                            source_url=f"kas://{r.content_id}",
+                            source_title=f"[KB] {r.title}",
+                            content=r.chunk_text,
+                            credibility="high",  # KAS = vetted personal knowledge
+                        ))
+            except Exception as e:
+                logger.warning(f"KAS query failed for '{sq.question[:50]}...': {e}")
+
+        if kas_findings:
+            logger.info(f"Found {len(kas_findings)} relevant items from knowledge base")
+        return kas_findings
 
     @start()
     def decompose_query(self) -> str:
         """Decompose the research query into sub-questions."""
         logger.info(f"Decomposing query: {self.state.query[:100]}...")
 
-        decomposer = create_query_decomposer_agent(self.llm)
+        decomposer = create_query_decomposer_agent(self._decomposer_llm)
 
         depth_guidance = {
             "shallow": "Create 2-3 focused sub-questions covering the basics.",
@@ -101,8 +171,8 @@ For each sub-question, provide:
 - source_types: Preferred sources (docs, academic, news, forum, blog)
 - importance: high, medium, or low
 
-Output as JSON array of sub-questions.""",
-            expected_output="JSON array of sub-questions with search keywords",
+Output as JSON with a "sub_questions" array.""",
+            expected_output="JSON with sub_questions array",
             agent=decomposer,
         )
 
@@ -116,7 +186,7 @@ Output as JSON array of sub-questions.""",
         result = decompose_crew.kickoff()
 
         try:
-            sub_questions_data = self._extract_json(result.raw)
+            sub_questions_data = json.loads(result.raw)
             if isinstance(sub_questions_data, dict) and "sub_questions" in sub_questions_data:
                 sub_questions_data = sub_questions_data["sub_questions"]
             if not isinstance(sub_questions_data, list):
@@ -127,7 +197,7 @@ Output as JSON array of sub-questions.""",
                 for sq in sub_questions_data
             ]
             logger.info(f"Decomposed into {len(self.state.sub_questions)} sub-questions")
-        except Exception as e:
+        except json.JSONDecodeError as e:
             logger.warning(f"Could not parse sub-questions: {e}")
             # Fallback: use original query as single sub-question
             self.state.sub_questions = [
@@ -146,7 +216,10 @@ Output as JSON array of sub-questions.""",
         """Gather information for each sub-question."""
         logger.info(f"Gathering information for {len(self.state.sub_questions)} sub-questions...")
 
-        gatherer = create_gatherer_agent(self.llm)
+        # Query KAS first for existing knowledge (using sync client)
+        kas_findings = self._query_kas_sync(self.state.sub_questions)
+
+        gatherer = create_gatherer_agent(self._gatherer_llm)
 
         # Format sub-questions for the task
         sq_text = "\n".join([
@@ -180,13 +253,13 @@ Output as JSON with:
         result = gather_crew.kickoff()
 
         try:
-            findings_data = self._extract_json(result.raw)
+            findings_data = json.loads(result.raw)
             if isinstance(findings_data, dict) and "findings" in findings_data:
                 findings_data = findings_data["findings"]
             if not isinstance(findings_data, list):
                 findings_data = [findings_data]
 
-            self.state.findings = [
+            agent_findings = [
                 Finding(**f) if isinstance(f, dict) else Finding(
                     source_url="https://example.com",
                     source_title="Research Source",
@@ -194,10 +267,9 @@ Output as JSON with:
                 )
                 for f in findings_data
             ]
-            logger.info(f"Gathered {len(self.state.findings)} findings")
-        except Exception as e:
+        except json.JSONDecodeError as e:
             logger.warning(f"Could not parse findings: {e}")
-            self.state.findings = [
+            agent_findings = [
                 Finding(
                     source_url="https://docs.example.com",
                     source_title="Documentation",
@@ -206,6 +278,13 @@ Output as JSON with:
                 )
             ]
 
+        # Combine: KAS findings first (higher credibility), then agent findings
+        self.state.findings = kas_findings + agent_findings
+        logger.info(
+            f"Gathered {len(self.state.findings)} findings "
+            f"({len(kas_findings)} from KB, {len(agent_findings)} from research)"
+        )
+
         return "gathering_complete"
 
     @listen(gather_information)
@@ -213,7 +292,7 @@ Output as JSON with:
         """Synthesize gathered findings into coherent analysis."""
         logger.info("Synthesizing findings...")
 
-        synthesizer = create_synthesizer_agent(self.llm)
+        synthesizer = create_synthesizer_agent(self._synthesizer_llm)
 
         # Format findings for synthesis
         findings_text = "\n\n".join([
@@ -258,11 +337,11 @@ Output as JSON with:
         result = synthesize_crew.kickoff()
 
         try:
-            synthesis = self._extract_json(result.raw)
+            synthesis = json.loads(result.raw)
             self.state.synthesis = synthesis
             self.state.confidence_score = synthesis.get("confidence_score", 75)
             logger.info(f"Synthesis complete. Confidence: {self.state.confidence_score}%")
-        except Exception as e:
+        except json.JSONDecodeError as e:
             logger.warning(f"Could not parse synthesis: {e}")
             self.state.synthesis = {
                 "themes": ["Research findings"],
@@ -278,14 +357,30 @@ Output as JSON with:
         """Generate the final formatted report."""
         logger.info("Generating report...")
 
-        reporter = create_reporter_agent(self.llm)
+        reporter = create_reporter_agent(self._reporter_llm)
 
         # Format synthesis for report
         synthesis_text = json.dumps(self.state.synthesis, indent=2)
-        sources_text = "\n".join([
-            f"- {f.source_title}: {f.source_url}"
-            for f in self.state.findings
-        ])
+
+        # Separate KAS sources from external sources
+        kas_sources = [f for f in self.state.findings if f.source_url.startswith("kas://")]
+        external_sources = [f for f in self.state.findings if not f.source_url.startswith("kas://")]
+
+        sources_text = ""
+        if kas_sources:
+            sources_text += "From your knowledge base:\n"
+            sources_text += "\n".join([
+                f"- {f.source_title}: {f.source_url}"
+                for f in kas_sources
+            ])
+            sources_text += "\n\n"
+
+        if external_sources:
+            sources_text += "External sources:\n"
+            sources_text += "\n".join([
+                f"- {f.source_title}: {f.source_url}"
+                for f in external_sources
+            ])
 
         report_task = Task(
             description=f"""Create a {self.state.depth} research report in {self.state.output_format} format.
@@ -303,7 +398,7 @@ Report Requirements:
 2. List key points as bullets
 3. Provide detailed analysis
 4. Note any limitations
-5. End with a Sources section listing all references
+5. End with a Sources section - separate "From your knowledge base:" and "External sources:" sections
 
 Use inline citations: [Source Name](url)
 Confidence Score: {self.state.confidence_score}%""",
@@ -333,46 +428,12 @@ Confidence Score: {self.state.confidence_score}%""",
         logger.info(f"Report generated: {len(self.state.report)} characters")
         return "report_complete"
 
-    def _extract_json(self, text: str) -> dict | list:
-        """Extract JSON from LLM response text."""
-        # Try to find JSON in code blocks first
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-        if json_match:
-            text = json_match.group(1)
-
-        text = text.strip()
-
-        # Find first [ or {
-        start_bracket = -1
-        start_brace = -1
-
-        for i, c in enumerate(text):
-            if c == "[" and start_bracket == -1:
-                start_bracket = i
-            elif c == "{" and start_brace == -1:
-                start_brace = i
-            if start_bracket != -1 and start_brace != -1:
-                break
-
-        if start_bracket == -1 and start_brace == -1:
-            raise ValueError("No JSON found in text")
-
-        if start_bracket != -1 and (start_brace == -1 or start_bracket < start_brace):
-            end = text.rfind("]")
-            if end != -1:
-                text = text[start_bracket : end + 1]
-        else:
-            end = text.rfind("}")
-            if end != -1:
-                text = text[start_brace : end + 1]
-
-        return json.loads(text)
-
 
 async def run_research(
     query: str,
     depth: str = "medium",
     output_format: str = "markdown",
+    use_structured_outputs: bool = True,
 ) -> ResearchState:
     """Run the research flow.
 
@@ -380,11 +441,12 @@ async def run_research(
         query: The research query
         depth: Research depth (shallow, medium, deep)
         output_format: Output format (markdown, plain)
+        use_structured_outputs: Whether to use outlines for guaranteed JSON
 
     Returns:
         ResearchState with report and sources
     """
-    flow = ResearchFlow()
+    flow = ResearchFlow(use_structured_outputs=use_structured_outputs)
     flow.state.query = query
     flow.state.depth = depth
     flow.state.output_format = output_format
