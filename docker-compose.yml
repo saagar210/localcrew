@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: localcrew-postgres
+    environment:
+      POSTGRES_USER: localcrew
+      POSTGRES_PASSWORD: localcrew
+      POSTGRES_DB: localcrew
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U localcrew"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.19.0
+    container_name: localcrew-mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://localcrew:localcrew@postgres:5432/localcrew
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://localcrew:localcrew@postgres:5432/localcrew
+      --default-artifact-root /mlflow/artifacts
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:

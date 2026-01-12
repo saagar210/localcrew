@@ -1,0 +1,83 @@
+[project]
+name = "localcrew"
+version = "0.1.0"
+description = "Local-first multi-agent automation platform for task decomposition"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Saagar" }
+]
+keywords = ["crewai", "agents", "automation", "mlx", "task-management"]
+
+dependencies = [
+    # Core
+    "fastapi>=0.128.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+
+    # Database
+    "sqlmodel>=0.0.22",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+
+    # CrewAI
+    "crewai>=1.8.0",
+    "crewai-tools>=0.30.0",
+
+    # MLX (Apple Silicon)
+    "mlx>=0.30.0",
+    "mlx-lm>=0.21.0",
+
+    # CLI
+    "typer>=0.15.0",
+    "rich>=13.9.0",
+
+    # Metrics
+    "mlflow>=3.8.0",
+
+    # Utilities
+    "httpx>=0.28.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "aiosqlite>=0.20.0",
+    "greenlet>=3.0.0",
+]
+
+[project.scripts]
+localcrew = "localcrew.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/localcrew"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true

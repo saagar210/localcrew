@@ -1,0 +1,346 @@
+# LocalCrew - Product Requirements Document
+# Version: 1.1 | Created: January 11, 2026 | Updated: January 11, 2026
+
+## Executive Summary
+
+LocalCrew is a local-first multi-agent automation platform built on CrewAI that runs entirely on Apple Silicon (M4 Pro 48GB). The primary use case is intelligent task decomposition that automatically creates subtasks in Task Master AI, enabling better project planning and execution through agent collaboration.
+
+---
+
+## Problem Statement
+
+Complex software engineering tasks require decomposition into actionable subtasks. Currently this is a manual, time-consuming process that:
+1. Requires context-switching from implementation to planning
+2. Often misses edge cases and dependencies
+3. Doesn't leverage accumulated knowledge from past projects
+4. Has no systematic approach to research or documentation tasks
+
+**Target User:** Senior engineer (the developer) who manages multiple personal projects using Task Master AI and wants automated, intelligent task breakdown.
+
+---
+
+## Solution Overview
+
+LocalCrew provides a hybrid CLI + Dashboard interface for orchestrating multi-agent crews that:
+1. Decompose complex tasks into actionable subtasks
+2. Automatically sync decomposed tasks to Task Master AI
+3. Flag low-confidence decompositions for human review
+4. Run 100% locally using MLX-native models on M4 Pro
+
+---
+
+## Core Requirements
+
+### Primary Feature: Task Decomposition Crew
+
+**Input:** Natural language task description
+```
+"Add user authentication with OAuth2 support to the FastAPI backend"
+```
+
+**Output:** Structured subtasks with metadata
+```yaml
+subtasks:
+  - title: "Research OAuth2 providers (Google, GitHub, Auth0)"
+    type: research
+    estimated_complexity: low
+    dependencies: []
+  - title: "Design authentication flow and database schema"
+    type: design
+    estimated_complexity: medium
+    dependencies: [1]
+  - title: "Implement OAuth2 callback endpoints"
+    type: coding
+    estimated_complexity: high
+    dependencies: [2]
+  # ... etc
+```
+
+**Behavior:**
+- Auto-creates subtasks in Task Master AI
+- Assigns confidence score (0-100) to each decomposition
+- Flags items with confidence < 70 for human review
+- Supports task types: coding, research, devops, documentation
+
+### Task Types Supported
+
+| Type | Description | Agent Strategy |
+|------|-------------|----------------|
+| Coding Features | Feature implementation | Analyze requirements → design → implement → test → document |
+| Research Tasks | Information gathering | Define scope → search → synthesize → recommend |
+| DevOps/Infra | Infrastructure work | Assess current state → plan → implement → verify → monitor |
+| Documentation | Docs and guides | Outline → draft → review → publish |
+
+### Second Crew: Research Agent
+
+**Purpose:** Deep research on topics, compile findings, optionally store in KAS (Knowledge Activation System).
+
+**Workflow:**
+1. Accept research query
+2. Break into sub-questions
+3. Gather information (web search, local docs, KAS)
+4. Synthesize findings
+5. Generate structured report
+6. Optionally insert key findings into KAS
+
+---
+
+## Technical Architecture
+
+### Deployment Model
+- **Type:** Standalone FastAPI service
+- **Database:** PostgreSQL (separate from KAS)
+- **Inference:** MLX-native (no Ollama wrapper)
+- **Default Model:** Qwen2.5:14B-Q4
+
+### Stack
+
+| Component | Technology | Rationale |
+|-----------|------------|-----------|
+| Framework | CrewAI 1.8.0+ | Production-proven, 12M+ executions/day |
+| API | FastAPI 0.128+ | Consistent with KAS, MLX Hub |
+| Database | PostgreSQL 16+ | Workflow state, execution history |
+| ORM | SQLModel | Consistent with MLX Hub |
+| Inference | MLX 0.30+ | Native M4 Pro performance |
+| Models | Qwen2.5:14B-Q4 | Balance of speed and quality |
+| CLI | Typer | Python CLI framework |
+| Dashboard | Next.js 15 + shadcn/ui | Consistent with other projects |
+| Metrics | MLflow 3.8+ | Agent performance tracking |
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    LocalCrew Platform                    │
+├─────────────────────────────────────────────────────────┤
+│  CLI (Typer)              │  Dashboard (Next.js)        │
+│  - localcrew decompose    │  - Workflow builder         │
+│  - localcrew research     │  - Execution history        │
+│  - localcrew status       │  - Agent metrics            │
+├─────────────────────────────────────────────────────────┤
+│                   FastAPI Backend                        │
+│  ├── /api/crews/decompose                               │
+│  ├── /api/crews/research                                │
+│  ├── /api/workflows                                     │
+│  └── /api/executions                                    │
+├─────────────────────────────────────────────────────────┤
+│                   CrewAI Flows Engine                    │
+│  ├── Task Decomposition Crew                            │
+│  │   ├── Analyzer Agent (understands task scope)        │
+│  │   ├── Planner Agent (creates subtask structure)      │
+│  │   ├── Validator Agent (checks completeness)          │
+│  │   └── Confidence Scorer                              │
+│  └── Research Crew                                      │
+│      ├── Query Decomposer                               │
+│      ├── Information Gatherer                           │
+│      ├── Synthesizer                                    │
+│      └── Report Generator                               │
+├─────────────────────────────────────────────────────────┤
+│                   Integrations                           │
+│  ├── Task Master AI (bidirectional sync)                │
+│  ├── MLX Inference Engine                               │
+│  └── MLflow Tracking                                    │
+├─────────────────────────────────────────────────────────┤
+│                   PostgreSQL                             │
+│  ├── workflows (definitions)                            │
+│  ├── executions (history)                               │
+│  ├── agents (performance metrics)                       │
+│  └── reviews (human feedback on flagged items)          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Integration Points
+
+**Task Master AI Integration:**
+- Read: Fetch existing tasks/projects for context
+- Write: Create subtasks from decomposition
+- Sync: Update task status when crews complete work
+- API: Use Task Master MCP tools
+
+**MLX Integration:**
+- Direct MLX inference (bypass Ollama)
+- Model: Qwen2.5:14B-Q4 (fits comfortably in 48GB with headroom)
+- Fallback: Qwen2.5:7B-Q4 for simple tasks
+
+---
+
+## User Interface
+
+### CLI Commands
+
+```bash
+# Task decomposition
+localcrew decompose "Add OAuth2 authentication to FastAPI backend"
+localcrew decompose --file task.md --project "mlx-model-hub"
+
+# Research
+localcrew research "Compare CrewAI vs AutoGen for multi-agent systems"
+localcrew research --depth deep --output report.md
+
+# Workflow management
+localcrew workflows list
+localcrew workflows run weekly-research
+
+# Status and history
+localcrew status
+localcrew history --last 10
+
+# Review flagged items
+localcrew review --pending
+```
+
+### Dashboard Views
+
+1. **Home:** Active workflows, recent executions, pending reviews
+2. **Workflows:** Create/edit workflow definitions
+3. **Executions:** Detailed execution history with agent traces
+4. **Crews:** Available crews, agent configurations
+5. **Metrics:** MLflow integration, performance over time
+6. **Reviews:** Human-in-the-loop for flagged decompositions
+
+---
+
+## Error Handling Strategy
+
+**Human Review Gate:**
+- Confidence threshold: 70%
+- Items below threshold queued for human review
+- Review interface shows agent reasoning
+- User can: approve, modify, reject, or re-run with guidance
+
+**Failure Modes:**
+| Failure | Handling |
+|---------|----------|
+| Model inference error | Retry with smaller model, then fail gracefully |
+| Task Master API unavailable | Queue for retry, store locally |
+| Ambiguous task input | Flag for clarification before decomposition |
+| Circular dependencies detected | Alert user, suggest restructure |
+
+---
+
+## Success Metrics
+
+| Metric | Target | Measurement |
+|--------|--------|-------------|
+| Decomposition accuracy | >80% subtasks accepted without modification | Human review rate |
+| Time savings | >50% faster than manual decomposition | Before/after comparison |
+| Usage frequency | Weekly active use | CLI/API calls per week |
+| Task coverage | All 4 types (coding, research, devops, docs) | Type distribution |
+
+---
+
+## Development Phases
+
+### Phase 1: Foundation (Weeks 1-2)
+- [ ] Project scaffolding (FastAPI, PostgreSQL, SQLModel)
+- [ ] MLX inference integration
+- [ ] Basic CLI structure
+- [ ] Database schema and migrations
+
+### Phase 2: Task Decomposition Crew (Weeks 3-4)
+- [ ] CrewAI Flows setup
+- [ ] Analyzer, Planner, Validator agents
+- [ ] Confidence scoring system
+- [ ] Task Master AI integration (create subtasks)
+
+### Phase 3: Human Review System (Week 5)
+- [ ] Review queue and API
+- [ ] CLI review commands
+- [ ] Feedback loop to improve prompts
+
+### Phase 4: Research Crew (Week 6)
+- [ ] Query decomposition agent
+- [ ] Information gathering (web + local)
+- [ ] Synthesis and report generation
+- [ ] Optional KAS integration
+
+### Phase 5: Dashboard MVP (Weeks 7-8)
+- [ ] Next.js project setup
+- [ ] Home, Workflows, Executions views
+- [ ] MLflow metrics integration
+- [ ] Review interface
+
+### Phase 6: Polish and Iterate (Weeks 9+)
+- [ ] Additional crews as needed
+- [ ] Performance optimization
+- [ ] Workflow templates
+- [ ] Documentation
+
+---
+
+## Constraints and Assumptions
+
+### Constraints
+- **Hardware:** Single M4 Pro Mac with 48GB RAM
+- **Models:** MLX-compatible models only (no CUDA)
+- **Memory budget:** ~36GB for MLX (48GB - 12GB system headroom)
+- **Usage pattern:** Weekly batch usage, not real-time
+
+### Assumptions
+- Task Master AI MCP tools remain stable
+- Qwen2.5:14B-Q4 quality sufficient for decomposition
+- CrewAI Flows handles state management reliably
+- User available for weekly review of flagged items
+
+---
+
+## Risks and Mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| **Maintenance burden** (primary concern) | High | Simple architecture, leverage existing patterns from KAS/MLX Hub, comprehensive logging |
+| Model quality insufficient | Medium | Start with Qwen2.5:14B, upgrade to DeepSeek R1 if needed |
+| Task Master API changes | Medium | Abstract integration behind interface |
+| Scope creep | Medium | Strict phase boundaries, MVP-first |
+| CrewAI learning curve | Low | Start with simple 2-agent crews |
+
+---
+
+## Out of Scope (MVP)
+
+- GitHub integration (PR triggers, code review)
+- KAS read/write integration (except optional for Research Crew)
+- Voice interface
+- Multi-user support
+- Real-time collaborative editing
+- Mobile interface
+
+---
+
+## Resolved Decisions
+
+1. **Task Master context:** Yes - decomposition will include recent Task Master history for better context-aware breakdown
+2. **Confidence threshold:** 70% confirmed - items below this threshold require human review
+3. **Research citations:** Inline markdown links with source URL and retrieval date, plus a "Sources" section at end of reports
+4. **Dashboard workflow builder:** Visual drag-and-drop builder (not YAML-only) for better UX
+
+---
+
+## Appendix: Example Workflows
+
+### Weekly Research Digest
+```yaml
+name: weekly-research
+trigger: manual  # or cron for Phase 6+
+crew: research
+config:
+  queries:
+    - "Latest developments in MLX ecosystem"
+    - "CrewAI best practices and patterns"
+    - "Local LLM performance benchmarks"
+  depth: medium
+  output: markdown
+  store_to_kas: false
+```
+
+### Sprint Planning Decomposition
+```yaml
+name: sprint-decompose
+trigger: manual
+crew: task_decomposition
+config:
+  input_source: clipboard  # or file, or inline
+  project: auto-detect
+  auto_sync_taskmaster: true
+  review_threshold: 70
+```
